@@ -17,9 +17,11 @@ mod parents {
     #[cpp_struct]
     pub struct Left {
         #[vtable(
-            left_value(&self) -> i32;
+            offset(0x8);
             untouched(&self) -> i32;
             apply(&self, payload: *const Payload) -> i32;
+            offset(0);
+            left_value(&self) -> i32;
         )]
         vtable: *const (),
         pub x: i32,
@@ -29,8 +31,10 @@ mod parents {
     #[cpp_struct]
     pub struct Right {
         #[vtable(
-            right_value(&self) -> i32;
+            offset(0x8);
             set_right(&mut self, value: i32);
+            offset(0);
+            right_value(&self) -> i32;
         )]
         vtable: *const (),
         pub y: i32,

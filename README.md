@@ -51,8 +51,14 @@ metadata, and renamed type aliases are not resolved by the macro.
 - `#[repr(C)]`, `unsafe extern "C"` slots and `#[inline(always)]` methods are implied.
 - Vtable fields must be private `*const ()` placeholders. Expansion replaces
   each with a pointer to a generated private table. Other fields stay unchanged.
-- Each `pad(n)` skips `n` pointer-sized slots, not bytes. Entries follow native
-  slot order. Multiple vtable fields are allowed at their declared positions.
+- `pad(n)` advances by `n` pointer-sized slots; `offset(n)` sets the cursor to
+  byte offset `n` from this vtable's start, not a process address. Hex literals
+  such as `offset(0x150)` are supported. Every method advances by one slot.
+  Methods may appear in any order: expansion sorts them by offset, fills gaps,
+  and rejects overlaps, misalignment and arithmetic overflow for the target's
+  pointer width. `offset(0)` returns to the first slot; `pad(0)` is rejected.
+- Multiple vtable fields are allowed at their declared positions. Their cursors
+  are independent; table-relative offsets do not move the object's pointer fields.
 - Entries omit `fn` and `unsafe`. Generated forwarding methods are always public
   and unsafe. Document native preconditions with `///` on entries.
 - Receivers may be `&self`, `&mut self`, `this: *const Self` or `this: *mut Self`.

@@ -29,6 +29,7 @@ mod tests;
 
 enum Entry {
     Pad(usize),
+    Offset(usize),
     Method(Method),
 }
 
@@ -41,19 +42,26 @@ impl Parse for Entries {
             let name: Ident = input.parse()?;
             let content;
             syn::parenthesized!(content in input);
-            if name == "pad" {
+            if name == "pad" || name == "offset" {
                 if !attrs.is_empty() {
-                    return Err(Error::new(name.span(), "padding cannot have attributes"));
+                    return Err(Error::new(
+                        name.span(),
+                        "layout directives cannot have attributes",
+                    ));
                 }
                 let count: syn::LitInt = content.parse()?;
                 let count = count.base10_parse::<usize>()?;
-                if count == 0 {
+                if count == 0 && name == "pad" {
                     return Err(Error::new(name.span(), "pad count must be positive"));
                 }
                 if !content.is_empty() {
-                    return Err(content.error("expected one slot count"));
+                    return Err(content.error("expected one integer literal"));
                 }
-                entries.push(Entry::Pad(count));
+                entries.push(if name == "pad" {
+                    Entry::Pad(count)
+                } else {
+                    Entry::Offset(count)
+                });
             } else {
                 let mut args =
                     Punctuated::<FnArg, Token![,]>::parse_terminated(&content)?.into_iter();
@@ -466,13 +474,13 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                     .collect::<String>()
             )
         };
-        let mut slots = Vec::new();
-        for (i, entry) in entries.0.into_iter().enumerate() {
+        let mut layout = Vec::new();
+        for entry in entries.0 {
             match entry {
                 Entry::Pad(n) => {
-                    let pad = format_ident!("_pad_{}", i);
-                    slots.push(quote!(#pad: [usize; #n]));
+                    layout.push(LayoutEntry::Pad(n));
                 }
+                Entry::Offset(n) => layout.push(LayoutEntry::Offset(n)),
                 Entry::Method(mut m) => {
                     if m.attrs.iter().any(|a| !a.path().is_ident("doc")) {
                         return Err(Error::new(
@@ -501,8 +509,10 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                     replace.visit_type_mut(&mut this_ty);
                     let types = m.args.iter().map(|(_, t)| t);
                     let output = &m.output;
-                    slots
-                        .push(quote!(#method: unsafe extern "C" fn(#this_ty, #(#types),*) #output));
+                    layout.push(LayoutEntry::Method(
+                        method.clone(),
+                        quote!(#method: unsafe extern "C" fn(#this_ty, #(#types),*) #output),
+                    ));
                     let args = m.args.iter().map(|(n, _)| n);
                     let owner = Ident::new("__owner", proc_macro2::Span::mixed_site());
                     let adjusted = if matches!(m.kind.to_string().as_str(), "mutable" | "raw_mut") {
@@ -521,7 +531,15 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                 }
             }
         }
-        tables.push(quote!(#[derive(Debug)] #[repr(C)] struct #table { #(#slots,)* }));
+        // The proc macro runs on the host, but offsets belong to the target ABI.
+        for width in [16, 32, 64] {
+            let cfg = width.to_string();
+            let definition = match layout_fields(&layout, width / 8) {
+                Ok(slots) => quote!(#[derive(Debug)] #[repr(C)] struct #table { #(#slots,)* }),
+                Err(e) => e.into_compile_error(),
+            };
+            tables.push(quote!(#[cfg(target_pointer_width = #cfg)] #definition));
+        }
         field.ty = syn::parse_quote!(*const #table);
         field.attrs.retain(|a| !a.path().is_ident("vtable"));
     }
@@ -532,6 +550,73 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
         impl #name { #(#impls)* }
         #metadata
     })
+}
+
+enum LayoutEntry {
+    Pad(usize),
+    Offset(usize),
+    Method(Ident, Tokens),
+}
+
+fn layout_fields(entries: &[LayoutEntry], pointer_size: usize) -> syn::Result<Vec<Tokens>> {
+    let mut cursor = 0usize;
+    let mut extent = 0;
+    let mut methods = Vec::new();
+    let span = proc_macro2::Span::call_site();
+    for entry in entries {
+        match entry {
+            LayoutEntry::Pad(n) => {
+                cursor = n
+                    .checked_mul(pointer_size)
+                    .and_then(|n| cursor.checked_add(n))
+                    .ok_or_else(|| {
+                        Error::new(span, "vtable padding overflows the address range")
+                    })?;
+            }
+            LayoutEntry::Offset(n) => {
+                if n % pointer_size != 0 {
+                    return Err(Error::new(
+                        span,
+                        format!("vtable offset {n:#x} must be aligned to {pointer_size} bytes"),
+                    ));
+                }
+                cursor = *n;
+            }
+            LayoutEntry::Method(name, field) => {
+                methods.push((cursor, name, field));
+                cursor = cursor.checked_add(pointer_size).ok_or_else(|| {
+                    Error::new(
+                        name.span(),
+                        "vtable method offset overflows the address range",
+                    )
+                })?;
+            }
+        }
+        extent = extent.max(cursor);
+    }
+    methods.sort_by_key(|(offset, _, _)| *offset);
+    let mut fields = Vec::new();
+    let mut end = 0;
+    for (offset, name, field) in methods {
+        if offset < end {
+            return Err(Error::new(
+                name.span(),
+                "overlapping vtable methods at the same offset",
+            ));
+        }
+        append_padding(&mut fields, (offset - end) / pointer_size);
+        fields.push(field.clone());
+        end = offset + pointer_size;
+    }
+    append_padding(&mut fields, (extent - end) / pointer_size);
+    Ok(fields)
+}
+
+fn append_padding(fields: &mut Vec<Tokens>, slots: usize) {
+    if slots != 0 {
+        let name = format_ident!("_pad_{}", fields.len());
+        fields.push(quote!(#name: [usize; #slots]));
+    }
 }
 
 struct Replace<'a>(&'a Ident);

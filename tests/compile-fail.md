@@ -44,3 +44,23 @@ mod bindings {
 }
 fn expose(value: &bindings::Native) { let _ = value.vtable; }
 ```
+
+Overlapping slots and unaligned byte offsets are rejected for the target:
+
+```compile_fail
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Overlap {
+    #[vtable(first(&self); offset(0); second(&self);)]
+    vtable: *const (),
+}
+```
+
+```compile_fail
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Unaligned {
+    #[vtable(offset(1); value(&self);)]
+    vtable: *const (),
+}
+```
