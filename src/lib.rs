@@ -1,0 +1,614 @@
+#![doc = include_str!("../README.md")]
+#![doc = include_str!("../tests/compile-fail.md")]
+#![forbid(unsafe_code)]
+use proc_macro::TokenStream;
+use proc_macro2::TokenStream as Tokens;
+use quote::{format_ident, quote};
+use std::hash::{Hash, Hasher};
+use syn::visit_mut::VisitMut;
+use syn::{
+    parse::{Parse, ParseStream},
+    parse_macro_input,
+    punctuated::Punctuated,
+    spanned::Spanned,
+    Attribute, Error, Fields, FnArg, Ident, ItemStruct, Pat, ReturnType, Token, Type, TypePath,
+    Visibility,
+};
+
+#[derive(Clone)]
+struct Method {
+    attrs: Vec<Attribute>,
+    name: Ident,
+    kind: Ident,
+    args: Vec<(Ident, Type)>,
+    output: ReturnType,
+}
+
+#[cfg(test)]
+mod tests;
+
+enum Entry {
+    Pad(usize),
+    Method(Method),
+}
+
+struct Entries(Vec<Entry>);
+impl Parse for Entries {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut entries = Vec::new();
+        while !input.is_empty() {
+            let attrs = input.call(Attribute::parse_outer)?;
+            let name: Ident = input.parse()?;
+            let content;
+            syn::parenthesized!(content in input);
+            if name == "pad" {
+                if !attrs.is_empty() {
+                    return Err(Error::new(name.span(), "padding cannot have attributes"));
+                }
+                let count: syn::LitInt = content.parse()?;
+                let count = count.base10_parse::<usize>()?;
+                if count == 0 {
+                    return Err(Error::new(name.span(), "pad count must be positive"));
+                }
+                if !content.is_empty() {
+                    return Err(content.error("expected one slot count"));
+                }
+                entries.push(Entry::Pad(count));
+            } else {
+                let mut args =
+                    Punctuated::<FnArg, Token![,]>::parse_terminated(&content)?.into_iter();
+                let receiver = args.next().ok_or_else(|| {
+                    Error::new(
+                        name.span(),
+                        "expected &self, &mut self, or this: *const/*mut Self",
+                    )
+                })?;
+                let kind = match receiver {
+                    FnArg::Receiver(r) if r.reference.is_some() && r.colon_token.is_none() => {
+                        if r.mutability.is_some() {
+                            "mutable"
+                        } else {
+                            "shared"
+                        }
+                    }
+                    FnArg::Typed(arg) => {
+                        let valid_name = matches!(&*arg.pat, Pat::Ident(p) if p.ident == "this");
+                        match &*arg.ty {
+                            Type::Ptr(p)
+                                if valid_name
+                                    && matches!(&*p.elem, Type::Path(t) if t.path.is_ident("Self")) =>
+                            {
+                                if p.mutability.is_some() {
+                                    "raw_mut"
+                                } else {
+                                    "raw_const"
+                                }
+                            }
+                            _ => {
+                                return Err(Error::new(
+                                    arg.span(),
+                                    "raw receiver must be this: *const Self or this: *mut Self",
+                                ))
+                            }
+                        }
+                    }
+                    r @ FnArg::Receiver(_) => {
+                        return Err(Error::new(r.span(), "expected &self or &mut self"))
+                    }
+                };
+                let mut named = Vec::new();
+                for arg in args {
+                    let FnArg::Typed(arg) = arg else {
+                        return Err(Error::new(arg.span(), "unexpected receiver"));
+                    };
+                    let Pat::Ident(pat) = *arg.pat else {
+                        return Err(Error::new(arg.span(), "arguments must have names"));
+                    };
+                    if pat.by_ref.is_some() || pat.subpat.is_some() || pat.ident == "this" {
+                        return Err(Error::new(
+                            pat.span(),
+                            "expected a plain argument name other than this",
+                        ));
+                    }
+                    named.push((pat.ident, *arg.ty));
+                }
+                entries.push(Entry::Method(Method {
+                    attrs,
+                    name,
+                    kind: Ident::new(kind, proc_macro2::Span::call_site()),
+                    args: named,
+                    output: input.parse()?,
+                }));
+            }
+            input.parse::<Token![;]>()?;
+        }
+        Ok(Self(entries))
+    }
+}
+
+// Metadata passed between expansions is tokenized, never kept in process-global state.
+impl Parse for Method {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        let kind = input.parse()?;
+        let name = input.parse()?;
+        let content;
+        syn::parenthesized!(content in input);
+        let args = Punctuated::<syn::PatType, Token![,]>::parse_terminated(&content)?;
+        let mut named = Vec::new();
+        for arg in args {
+            let Pat::Ident(p) = *arg.pat else {
+                return Err(input.error("invalid metadata argument"));
+            };
+            named.push((p.ident, *arg.ty));
+        }
+        let output = input.parse()?;
+        input.parse::<Token![;]>()?;
+        Ok(Self {
+            attrs,
+            name,
+            kind,
+            args: named,
+            output,
+        })
+    }
+}
+
+fn method_tokens(m: &Method) -> Tokens {
+    let Method {
+        attrs,
+        name,
+        kind,
+        args,
+        output,
+    } = m;
+    let args = args.iter().map(|(n, t)| quote!(#n: #t));
+    quote!(#(#attrs)* #kind #name(#(#args),*) #output;)
+}
+
+#[proc_macro_attribute]
+/// Generate native C++ layout and virtual/inherited forwarding methods.
+pub fn cpp_struct(args: TokenStream, item: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(
+            proc_macro2::Span::call_site(),
+            "cpp_struct takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let item = parse_macro_input!(item as ItemStruct);
+    start(item).unwrap_or_else(Error::into_compile_error).into()
+}
+
+fn start(mut item: ItemStruct) -> syn::Result<Tokens> {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
+        return Err(Error::new(
+            item.generics.span(),
+            "generic C++ layouts are not supported",
+        ));
+    }
+    for attr in &item.attrs {
+        if attr.path().is_ident("repr") {
+            return Err(Error::new(
+                attr.span(),
+                "cpp_struct supplies repr(C); remove explicit repr",
+            ));
+        }
+    }
+    let Fields::Named(fields) = &mut item.fields else {
+        return Err(Error::new(item.span(), "expected named fields"));
+    };
+    let mut parents = Vec::new();
+    for field in &mut fields.named {
+        let inherit = field
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("inherit"))
+            .collect::<Vec<_>>();
+        if inherit.len() > 1 {
+            return Err(Error::new(field.span(), "duplicate inherit attribute"));
+        }
+        if let Some(attr) = inherit.first() {
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(Error::new(attr.span(), "inherit takes no arguments"));
+            }
+            let Type::Path(ty) = &field.ty else {
+                return Err(Error::new(
+                    field.ty.span(),
+                    "inherit requires a concrete type path",
+                ));
+            };
+            if ty.qself.is_some() || ty.path.segments.iter().any(|s| !s.arguments.is_empty()) {
+                return Err(Error::new(
+                    ty.span(),
+                    "inherit requires a non-generic type path",
+                ));
+            }
+            if field
+                .attrs
+                .iter()
+                .any(|a| a.path().is_ident("vtable") || a.path().is_ident("cfg"))
+            {
+                return Err(Error::new(
+                    field.span(),
+                    "inherit cannot be combined with vtable or cfg",
+                ));
+            }
+            parents.push((field.ident.clone().unwrap(), ty.clone()));
+        }
+        field.attrs.retain(|a| !a.path().is_ident("inherit"));
+    }
+    advance(item, parents, Vec::new())
+}
+
+// Each parent exports a metadata macro. Ask it for signatures, then continue here.
+fn advance(
+    item: ItemStruct,
+    mut parents: Vec<(Ident, TypePath)>,
+    inherited: Vec<(Ident, Vec<Method>)>,
+) -> syn::Result<Tokens> {
+    if parents.is_empty() {
+        return finish(item, inherited);
+    }
+    let (field, ty) = parents.remove(0);
+    let mut metadata = ty.path.clone();
+    let last = metadata.segments.last_mut().unwrap();
+    last.ident = format_ident!("__ctables_{}", last.ident);
+    let mut signature = ty.path.clone();
+    let last = signature.segments.last_mut().unwrap();
+    last.ident = format_ident!("__Ctables{}", last.ident);
+    let remaining = parents.iter().map(|(f, t)| quote!(#f: #t;));
+    let collected = inherited.iter().map(|(f, ms)| {
+        let ms = ms.iter().map(method_tokens);
+        quote!(#f { #(#ms)* })
+    });
+    Ok(quote! {
+        #metadata! { (#ty) (#signature) (::rust_ctables::__cpp_inherit)
+            { { #item } { #(#remaining)* } { #(#collected)* } #field }
+        }
+    })
+}
+
+struct Continuation {
+    item: ItemStruct,
+    parents: Vec<(Ident, TypePath)>,
+    inherited: Vec<(Ident, Vec<Method>)>,
+}
+impl Parse for Continuation {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let state;
+        syn::braced!(state in input);
+        let body;
+        syn::braced!(body in state);
+        let item = body.parse()?;
+        let remaining;
+        syn::braced!(remaining in state);
+        let mut parents = Vec::new();
+        while !remaining.is_empty() {
+            let f = remaining.parse()?;
+            remaining.parse::<Token![:]>()?;
+            let t = remaining.parse()?;
+            remaining.parse::<Token![;]>()?;
+            parents.push((f, t));
+        }
+        let collected;
+        syn::braced!(collected in state);
+        let mut inherited = Vec::new();
+        while !collected.is_empty() {
+            let f = collected.parse()?;
+            let methods;
+            syn::braced!(methods in collected);
+            let mut ms = Vec::new();
+            while !methods.is_empty() {
+                ms.push(methods.parse()?);
+            }
+            inherited.push((f, ms));
+        }
+        let field = state.parse()?;
+        let methods;
+        syn::braced!(methods in input);
+        let mut ms = Vec::new();
+        while !methods.is_empty() {
+            ms.push(methods.parse()?);
+        }
+        inherited.push((field, ms));
+        Ok(Self {
+            item,
+            parents,
+            inherited,
+        })
+    }
+}
+
+#[doc(hidden)]
+#[proc_macro]
+pub fn __cpp_inherit(input: TokenStream) -> TokenStream {
+    let Continuation {
+        item,
+        parents,
+        inherited,
+    } = parse_macro_input!(input as Continuation);
+    advance(item, parents, inherited)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn receiver(kind: &Ident) -> (Tokens, Tokens, Tokens) {
+    match kind.to_string().as_str() {
+        "shared" => (
+            quote!(&self),
+            quote!(*const Self),
+            quote!(self as *const Self),
+        ),
+        "mutable" => (
+            quote!(&mut self),
+            quote!(*mut Self),
+            quote!(self as *mut Self),
+        ),
+        "raw_const" => (quote!(this: *const Self), quote!(*const Self), quote!(this)),
+        "raw_mut" => (quote!(this: *mut Self), quote!(*mut Self), quote!(this)),
+        _ => unreachable!(),
+    }
+}
+
+fn forwarding(m: &Method, call: &Tokens) -> Tokens {
+    let Method {
+        attrs,
+        name,
+        kind,
+        args,
+        output,
+    } = m;
+    let (recv, _, _) = receiver(kind);
+    let args = args.iter().map(|(n, t)| quote!(#n: #t));
+    quote! {
+        #(#attrs)*
+        /// # Safety
+        /// The native object and vtable must remain valid and match this declaration's
+        /// layout, slots and ABI. All native argument, aliasing and thread rules apply.
+        #[inline(always)]
+        pub unsafe fn #name(#recv, #(#args),*) #output { unsafe { #call } }
+    }
+}
+
+// These phases mirror the emitted layout, forwarding impls and metadata.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single ordered expansion pass over declared fields"
+)]
+fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Result<Tokens> {
+    let name = item.ident.clone();
+    let Fields::Named(fields) = &mut item.fields else {
+        unreachable!()
+    };
+    let mut tables = Vec::new();
+    let mut impls = Vec::new();
+    let mut methods = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (field, ms) in inherited {
+        let parent_ty = &fields
+            .named
+            .iter()
+            .find(|f| f.ident.as_ref() == Some(&field))
+            .unwrap()
+            .ty;
+        for m in ms {
+            if !names.insert(m.name.to_string()) {
+                return Err(Error::new(
+                    m.name.span(),
+                    "conflicting inherited method; use the parent subobjects directly",
+                ));
+            }
+            let method = &m.name;
+            let args = m.args.iter().map(|(n, _)| n);
+            let call = match m.kind.to_string().as_str() {
+                "raw_const" => {
+                    quote!(<#parent_ty>::#method(::core::ptr::addr_of!((*this).#field), #(#args),*))
+                }
+                "raw_mut" => {
+                    quote!(<#parent_ty>::#method(::core::ptr::addr_of_mut!((*this).#field), #(#args),*))
+                }
+                _ => quote!(self.#field.#method(#(#args),*)),
+            };
+            impls.push(forwarding(&m, &call));
+            methods.push(m);
+        }
+    }
+    for field in &mut fields.named {
+        let attrs = field
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("vtable"))
+            .collect::<Vec<_>>();
+        if attrs.is_empty() {
+            continue;
+        }
+        if attrs.len() != 1 {
+            return Err(Error::new(field.span(), "duplicate vtable attribute"));
+        }
+        if !matches!(field.vis, Visibility::Inherited) {
+            return Err(Error::new(
+                field.vis.span(),
+                "vtable pointers must be private",
+            ));
+        }
+        if field.attrs.iter().any(|a| a.path().is_ident("cfg")) {
+            return Err(Error::new(
+                field.span(),
+                "conditional vtable fields are not supported",
+            ));
+        }
+        if !matches!(&field.ty, Type::Ptr(p) if p.const_token.is_some() && matches!(&*p.elem, Type::Tuple(t) if t.elems.is_empty()))
+        {
+            return Err(Error::new(
+                field.ty.span(),
+                "declare the vtable field as *const ()",
+            ));
+        }
+        let entries = attrs[0].parse_args::<Entries>()?;
+        let fname = field.ident.as_ref().unwrap();
+        let table = format_ident!(
+            "{}{}VTable",
+            name,
+            fname
+                .to_string()
+                .split('_')
+                .map(|s| {
+                    let mut c = s.chars();
+                    c.next()
+                        .map(|x| x.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<String>()
+        );
+        let mut slots = Vec::new();
+        for (i, entry) in entries.0.into_iter().enumerate() {
+            match entry {
+                Entry::Pad(n) => {
+                    let pad = format_ident!("_pad_{}", i);
+                    slots.push(quote!(#pad: [usize; #n]));
+                }
+                Entry::Method(mut m) => {
+                    if m.attrs.iter().any(|a| !a.path().is_ident("doc")) {
+                        return Err(Error::new(
+                            m.name.span(),
+                            "only doc attributes are supported on methods",
+                        ));
+                    }
+                    if !names.insert(m.name.to_string()) {
+                        return Err(Error::new(
+                            m.name.span(),
+                            "conflicting vtable or inherited method name",
+                        ));
+                    }
+                    // Self in argument/return positions refers to the native type, not the vtable.
+                    let mut replace = Replace(&name);
+                    for (_, t) in &mut m.args {
+                        replace.visit_type_mut(t);
+                    }
+                    if let ReturnType::Type(_, t) = &mut m.output {
+                        replace.visit_type_mut(t);
+                    }
+                    let method = &m.name;
+                    let (_, this_ty, this) = receiver(&m.kind);
+                    let this_ty: Type = syn::parse2(this_ty)?;
+                    let mut this_ty = this_ty;
+                    replace.visit_type_mut(&mut this_ty);
+                    let types = m.args.iter().map(|(_, t)| t);
+                    let output = &m.output;
+                    slots
+                        .push(quote!(#method: unsafe extern "C" fn(#this_ty, #(#types),*) #output));
+                    let args = m.args.iter().map(|(n, _)| n);
+                    let adjusted = if matches!(m.kind.to_string().as_str(), "mutable" | "raw_mut") {
+                        quote!(::core::ptr::addr_of_mut!((*__owner).#fname).cast::<Self>())
+                    } else {
+                        quote!(::core::ptr::addr_of!((*__owner).#fname).cast::<Self>())
+                    };
+                    impls.push(forwarding(
+                        &m,
+                        &quote!({
+                            let __owner = #this;
+                            ((*(*__owner).#fname).#method)(#adjusted, #(#args),*)
+                        }),
+                    ));
+                    methods.push(m);
+                }
+            }
+        }
+        tables.push(quote!(#[derive(Debug)] #[repr(C)] struct #table { #(#slots,)* }));
+        field.ty = syn::parse_quote!(*const #table);
+        field.attrs.retain(|a| !a.path().is_ident("vtable"));
+    }
+    let metadata = metadata(&item, &methods);
+    Ok(quote! {
+        #[repr(C)] #item
+        #(#tables)*
+        impl #name { #(#impls)* }
+        #metadata
+    })
+}
+
+struct Replace<'a>(&'a Ident);
+impl VisitMut for Replace<'_> {
+    fn visit_type_mut(&mut self, ty: &mut Type) {
+        if matches!(ty, Type::Path(t) if t.path.is_ident("Self")) {
+            let n = self.0;
+            *ty = syn::parse_quote!(#n);
+        } else {
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+}
+
+static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn metadata(item: &ItemStruct, methods: &[Method]) -> Tokens {
+    let name = &item.ident;
+    // Associated signature types keep inherited argument names resolved in the
+    // parent's module, even when the child is in another module or crate.
+    let signature = format_ident!("__Ctables{}", name);
+    let metadata = format_ident!("__ctables_{}", name);
+    let mut aliases = Vec::new();
+    let mut definitions = Vec::new();
+    let mut descriptors = Vec::new();
+    for (i, m) in methods.iter().enumerate() {
+        let mut d = m.clone();
+        for (j, (_, ty)) in d.args.iter_mut().enumerate() {
+            let alias = format_ident!("M{}Arg{}", i, j);
+            aliases.push(quote!(type #alias;));
+            definitions.push(quote!(type #alias = #ty;));
+            *ty = syn::parse_quote!(<__Owner as __Signature>::#alias);
+        }
+        let alias = format_ident!("M{}Return", i);
+        let ret: Type = match &m.output {
+            ReturnType::Default => syn::parse_quote!(()),
+            ReturnType::Type(_, t) => *t.clone(),
+        };
+        aliases.push(quote!(type #alias;));
+        definitions.push(quote!(type #alias = #ret;));
+        d.output = syn::parse_quote!(-> <__Owner as __Signature>::#alias);
+        descriptors.push(method_tokens(&d));
+    }
+    // Substitute metavariables only after syn has parsed the signature types.
+    let descriptors = metavariables(quote!(#(#descriptors)*));
+    // Export a unique implementation name and re-export a predictable module-local
+    // name. Distinct modules may declare types with the same short name.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    quote!(#item #(#definitions)*).to_string().hash(&mut hash);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let exported = format_ident!("__rust_ctables_{}_{:x}_{}", name, hash.finish(), unique);
+    let vis = &item.vis;
+    quote! {
+        #[doc(hidden)] #[allow(non_camel_case_types)] #vis trait #signature { #(#aliases)* }
+        impl #signature for #name { #(#definitions)* }
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #exported {
+            (($owner:ty) ($signature:path) ($callback:path) { $($state:tt)* }) => {
+                $callback! { { $($state)* } { #descriptors } }
+            };
+        }
+        #[doc(hidden)] #[allow(unused_imports)] #vis use #exported as #metadata;
+    }
+}
+
+fn metavariables(tokens: Tokens) -> Tokens {
+    tokens
+        .into_iter()
+        .flat_map(|token| match token {
+            proc_macro2::TokenTree::Group(g) => {
+                let mut group = proc_macro2::Group::new(g.delimiter(), metavariables(g.stream()));
+                group.set_span(g.span());
+                vec![proc_macro2::TokenTree::Group(group)]
+            }
+            proc_macro2::TokenTree::Ident(ref id) if id == "__Owner" => {
+                quote!($owner).into_iter().collect()
+            }
+            proc_macro2::TokenTree::Ident(ref id) if id == "__Signature" => {
+                quote!($signature).into_iter().collect()
+            }
+            token => vec![token],
+        })
+        .collect()
+}

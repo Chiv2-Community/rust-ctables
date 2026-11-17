@@ -1,0 +1,14 @@
+[package]
+name = "rust-ctables-native-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-ctables = { path = "../.." }
+
+[build-dependencies]
+cc = "1"
