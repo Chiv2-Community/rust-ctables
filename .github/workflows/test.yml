@@ -18,6 +18,8 @@ jobs:
           - rust: nightly-2026-10-30
             features: --features nightly-receivers
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
