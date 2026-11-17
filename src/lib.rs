@@ -24,9 +24,6 @@ struct Method {
     output: ReturnType,
 }
 
-#[cfg(test)]
-mod tests;
-
 enum Entry {
     Pad(usize),
     Offset(usize),
@@ -741,3 +738,6 @@ fn metadata(item: &ItemStruct, methods: &[Method]) -> Tokens {
         #[doc(hidden)] #[allow(unused_imports)] #vis use #exported as #metadata;
     }
 }
+
+#[cfg(test)]
+mod tests;
