@@ -1,6 +1,77 @@
 use super::*;
 use syn::parse::Parser;
 
+fn rendered_docs(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            let syn::Meta::NameValue(v) = &attr.meta else {
+                return None;
+            };
+            let syn::Expr::Lit(v) = &v.value else {
+                return None;
+            };
+            let syn::Lit::Str(v) = &v.lit else {
+                return None;
+            };
+            Some(v.value())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn entry_safety_requirements_share_one_section_with_native_contract() {
+    let entries: Entries = syn::parse_quote! {
+        /// Trim caches.
+        ///
+        /// # Safety
+        /// Must run on the main thread.
+        ///
+        /// # Panics
+        /// Native failures are not Rust panics.
+        trim(this: *mut Self, caches: bool);
+    };
+    let Entry::Method(method) = &entries.0[0] else {
+        panic!("expected method");
+    };
+    let generated: syn::ImplItemFn = syn::parse2(forwarding(method, &quote!(()))).unwrap();
+    let docs = rendered_docs(&generated.attrs);
+    assert_eq!(docs.matches("# Safety").count(), 1);
+    assert!(docs.contains("Trim caches.\n\n"));
+    let native = docs.find("The native object").unwrap();
+    let specific = docs.find("Must run on the main thread.").unwrap();
+    let other = docs.find("# Panics").unwrap();
+    assert!(native < specific && specific < other);
+}
+
+#[test]
+fn multiline_safety_docs_and_default_sections_are_supported() {
+    let attrs: Vec<Attribute> =
+        vec![syn::parse_quote!(#[doc = "Summary.\n\n# Safety\nMust own the allocation."])];
+    let docs = rendered_docs(&safety_docs(&attrs));
+    assert_eq!(docs.matches("# Safety").count(), 1);
+    assert!(docs.contains("Must own the allocation."));
+    assert!(docs.contains("The native object"));
+    let default = rendered_docs(&safety_docs(&[]));
+    assert_eq!(default.matches("# Safety").count(), 1);
+    assert!(default.contains("The native object"));
+}
+
+#[test]
+fn example_headings_are_not_mistaken_for_safety_sections() {
+    let attrs =
+        vec![syn::parse_quote!(#[doc = "Example:\n```text\n# Safety\n```\n\n    # Safety"])];
+    let docs = rendered_docs(&safety_docs(&attrs));
+    let generic = docs.find("The native object").unwrap();
+    let last_heading = docs.rfind("# Safety").unwrap();
+    assert!(generic > last_heading);
+    assert!(docs.contains("```text\n# Safety\n```"));
+}
+
 fn reject(tokens: Tokens, expected: &str) {
     let item = syn::parse2(tokens).unwrap();
     let error = start(item).unwrap_err();

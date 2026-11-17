@@ -32,6 +32,8 @@ mod parents {
     pub struct Right {
         #[vtable(
             offset(0x8);
+            /// # Safety
+            /// Caller must have exclusive access to this native subobject.
             set_right(&mut self, value: i32);
             offset(0);
             right_value(&self) -> i32;

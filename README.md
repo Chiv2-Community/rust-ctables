@@ -60,7 +60,9 @@ metadata, and renamed type aliases are not resolved by the macro.
 - Multiple vtable fields are allowed at their declared positions. Their cursors
   are independent; table-relative offsets do not move the object's pointer fields.
 - Entries omit `fn` and `unsafe`. Generated forwarding methods are always public
-  and unsafe. Document native preconditions with `///` on entries.
+  and unsafe. Document native preconditions under a standard Rustdoc `# Safety`
+  heading on entries; the generated method keeps that section and includes the
+  common native-object/ABI contract without adding another heading.
 - Receivers may be `&self`, `&mut self`, `this: *const Self` or `this: *mut Self`.
   Raw receivers generate associated functions and never construct references.
 - Keep native-to-Rust conversions and ownership in handwritten wrappers.
@@ -89,6 +91,28 @@ signatures, native argument contracts, thread rules and reference aliasing.
 The macro performs no runtime validation and confers no ownership or GC pinning.
 Use raw receivers for mutable native state beyond a modeled prefix, such as
 shared allocators. The caller must still provide a valid complete allocation.
+
+```rust
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Allocator {
+    #[vtable(
+        /// Release cached memory.
+        ///
+        /// # Safety
+        /// Must run on the main thread.
+        trim(this: *mut Self, trim_thread_caches: bool);
+    )]
+    vtable: *const (),
+}
+```
+
+`# Safety` is a documentation convention checked by Clippy's `missing_safety_doc`
+lint, not a language-level proof or a runtime check. Ordinary entry documentation
+stays ordinary documentation; the macro does not infer safety rules from prose.
+Entry docs and safety requirements also propagate to inherited methods. Use
+literal `///` comments or `#[doc = "..."]` for heading merging; headings supplied
+by expressions such as `include_str!` cannot be inspected by this macro.
 
 ## Validation
 

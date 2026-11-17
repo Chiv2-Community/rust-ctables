@@ -368,15 +368,73 @@ fn forwarding(m: &Method, call: &Tokens) -> Tokens {
         args,
         output,
     } = m;
+    let attrs = safety_docs(attrs);
     let (recv, _, _) = receiver(kind);
     let args = args.iter().map(|(n, t)| quote!(#n: #t));
     quote! {
         #(#attrs)*
-        /// # Safety
-        /// The native object and vtable must remain valid and match this declaration's
-        /// layout, slots and ABI. All native argument, aliasing and thread rules apply.
         #[inline(always)]
         pub unsafe fn #name(#recv, #(#args),*) #output { unsafe { #call } }
+    }
+}
+
+fn safety_docs(attrs: &[Attribute]) -> Vec<Attribute> {
+    let mut docs = Vec::new();
+    let mut inserted = false;
+    let mut fence = None;
+    for attr in attrs {
+        let syn::Meta::NameValue(value) = &attr.meta else {
+            docs.push(attr.clone());
+            continue;
+        };
+        let syn::Expr::Lit(value) = &value.value else {
+            docs.push(attr.clone());
+            continue;
+        };
+        let syn::Lit::Str(value) = &value.lit else {
+            docs.push(attr.clone());
+            continue;
+        };
+        for line in value.value().split('\n') {
+            docs.push(syn::parse_quote!(#[doc = #line]));
+            let trimmed = line.trim_start();
+            // Ignore headings inside indented or fenced code examples.
+            if line.len() - trimmed.len() >= 4 {
+                continue;
+            }
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                let marker = trimmed.as_bytes()[0];
+                let count = trimmed.bytes().take_while(|&b| b == marker).count();
+                match fence {
+                    Some((open, length)) if open == marker && count >= length => fence = None,
+                    None => fence = Some((marker, count)),
+                    _ => {}
+                }
+                continue;
+            }
+            if fence.is_none() && trimmed.trim_end_matches('#').trim() == "# Safety" && !inserted {
+                append_native_safety(&mut docs);
+                inserted = true;
+            }
+        }
+    }
+    if !inserted {
+        docs.push(syn::parse_quote!(#[doc = ""]));
+        docs.push(syn::parse_quote!(#[doc = "# Safety"]));
+        append_native_safety(&mut docs);
+    }
+    docs
+}
+
+fn append_native_safety(docs: &mut Vec<Attribute>) {
+    for line in [
+        "",
+        "The native object and vtable must match this declaration's layout, slots and ABI",
+        "and remain valid for native accesses. All native argument, ownership, aliasing",
+        "and thread rules apply.",
+        "",
+    ] {
+        docs.push(syn::parse_quote!(#[doc = #line]));
     }
 }
 
