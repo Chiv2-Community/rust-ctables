@@ -42,6 +42,9 @@ corresponding parent-subobject address. Native vtables provide overrides and
 secondary-base adjustment thunks. Transitive inheritance and parents in other
 modules or crates are supported. Conflicting method names are compile errors;
 declare such parent fields without `#[inherit]` and call them explicitly.
+Use the parent's defining module path (for example `bindings::Left`) when it
+is outside the child's module: importing only the type does not import its
+metadata, and renamed type aliases are not resolved by the macro.
 
 ## Declaration rules
 

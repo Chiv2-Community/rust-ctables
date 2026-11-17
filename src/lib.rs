@@ -448,20 +448,24 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
         }
         let entries = attrs[0].parse_args::<Entries>()?;
         let fname = field.ident.as_ref().unwrap();
-        let table = format_ident!(
-            "{}{}VTable",
-            name,
-            fname
-                .to_string()
-                .split('_')
-                .map(|s| {
-                    let mut c = s.chars();
-                    c.next()
-                        .map(|x| x.to_uppercase().collect::<String>() + c.as_str())
-                        .unwrap_or_default()
-                })
-                .collect::<String>()
-        );
+        let table = if fname == "vtable" {
+            format_ident!("{}VTable", name)
+        } else {
+            format_ident!(
+                "{}{}VTable",
+                name,
+                fname
+                    .to_string()
+                    .split('_')
+                    .map(|s| {
+                        let mut c = s.chars();
+                        c.next()
+                            .map(|x| x.to_uppercase().collect::<String>() + c.as_str())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+            )
+        };
         let mut slots = Vec::new();
         for (i, entry) in entries.0.into_iter().enumerate() {
             match entry {
@@ -500,16 +504,17 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                     slots
                         .push(quote!(#method: unsafe extern "C" fn(#this_ty, #(#types),*) #output));
                     let args = m.args.iter().map(|(n, _)| n);
+                    let owner = Ident::new("__owner", proc_macro2::Span::mixed_site());
                     let adjusted = if matches!(m.kind.to_string().as_str(), "mutable" | "raw_mut") {
-                        quote!(::core::ptr::addr_of_mut!((*__owner).#fname).cast::<Self>())
+                        quote!(::core::ptr::addr_of_mut!((*#owner).#fname).cast::<Self>())
                     } else {
-                        quote!(::core::ptr::addr_of!((*__owner).#fname).cast::<Self>())
+                        quote!(::core::ptr::addr_of!((*#owner).#fname).cast::<Self>())
                     };
                     impls.push(forwarding(
                         &m,
                         &quote!({
-                            let __owner = #this;
-                            ((*(*__owner).#fname).#method)(#adjusted, #(#args),*)
+                            let #owner = #this;
+                            ((*(*#owner).#fname).#method)(#adjusted, #(#args),*)
                         }),
                     ));
                     methods.push(m);
@@ -553,12 +558,12 @@ fn metadata(item: &ItemStruct, methods: &[Method]) -> Tokens {
     let mut definitions = Vec::new();
     let mut descriptors = Vec::new();
     for (i, m) in methods.iter().enumerate() {
-        let mut d = m.clone();
-        for (j, (_, ty)) in d.args.iter_mut().enumerate() {
+        let mut args = Vec::new();
+        for (j, (arg, ty)) in m.args.iter().enumerate() {
             let alias = format_ident!("M{}Arg{}", i, j);
             aliases.push(quote!(type #alias;));
             definitions.push(quote!(type #alias = #ty;));
-            *ty = syn::parse_quote!(<__Owner as __Signature>::#alias);
+            args.push(quote!(#arg: <$owner as $signature>::#alias));
         }
         let alias = format_ident!("M{}Return", i);
         let ret: Type = match &m.output {
@@ -567,11 +572,12 @@ fn metadata(item: &ItemStruct, methods: &[Method]) -> Tokens {
         };
         aliases.push(quote!(type #alias;));
         definitions.push(quote!(type #alias = #ret;));
-        d.output = syn::parse_quote!(-> <__Owner as __Signature>::#alias);
-        descriptors.push(method_tokens(&d));
+        let Method {
+            attrs, kind, name, ..
+        } = m;
+        descriptors
+            .push(quote!(#(#attrs)* #kind #name(#(#args),*) -> <$owner as $signature>::#alias;));
     }
-    // Substitute metavariables only after syn has parsed the signature types.
-    let descriptors = metavariables(quote!(#(#descriptors)*));
     // Export a unique implementation name and re-export a predictable module-local
     // name. Distinct modules may declare types with the same short name.
     let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -586,29 +592,9 @@ fn metadata(item: &ItemStruct, methods: &[Method]) -> Tokens {
         #[macro_export]
         macro_rules! #exported {
             (($owner:ty) ($signature:path) ($callback:path) { $($state:tt)* }) => {
-                $callback! { { $($state)* } { #descriptors } }
+                $callback! { { $($state)* } { #(#descriptors)* } }
             };
         }
         #[doc(hidden)] #[allow(unused_imports)] #vis use #exported as #metadata;
     }
-}
-
-fn metavariables(tokens: Tokens) -> Tokens {
-    tokens
-        .into_iter()
-        .flat_map(|token| match token {
-            proc_macro2::TokenTree::Group(g) => {
-                let mut group = proc_macro2::Group::new(g.delimiter(), metavariables(g.stream()));
-                group.set_span(g.span());
-                vec![proc_macro2::TokenTree::Group(group)]
-            }
-            proc_macro2::TokenTree::Ident(ref id) if id == "__Owner" => {
-                quote!($owner).into_iter().collect()
-            }
-            proc_macro2::TokenTree::Ident(ref id) if id == "__Signature" => {
-                quote!($signature).into_iter().collect()
-            }
-            token => vec![token],
-        })
-        .collect()
 }

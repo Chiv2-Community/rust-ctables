@@ -72,11 +72,17 @@ pub struct Grandchild {
 pub struct Raw {
     #[vtable(
         pad(1);
-        add(this: *mut Self, amount: i32) -> i32;
+        add(this: *mut Self, __owner: i32) -> i32;
         get(this: *const Self) -> i32;
     )]
     vtable: *const (),
     value: i32,
+}
+
+#[cpp_struct]
+pub struct RawChild {
+    #[inherit]
+    pub base: Raw,
 }
 
 #[cfg(test)]
@@ -151,6 +157,8 @@ mod tests {
             assert_eq!(Raw::get(ptr), 7);
             assert_eq!(Raw::add(ptr, 5), 12);
             assert_eq!(Raw::get(ptr), 12);
+            assert_eq!(RawChild::add(ptr.cast(), 8), 20);
+            assert_eq!(RawChild::get(ptr.cast()), 20);
             fixture_delete_raw(ptr);
         }
     }
