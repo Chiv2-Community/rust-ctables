@@ -46,10 +46,50 @@ Use the parent's defining module path (for example `bindings::Left`) when it
 is outside the child's module: importing only the type does not import its
 metadata, and renamed type aliases are not resolved by the macro.
 
+### Extending inherited tables
+
+Combine `#[inherit]` and `#[vtable(...)]` on a base field to bind additional
+slots through that base's existing primary vptr. The field stays a base
+subobject; no pointer is added to the object layout.
+
+```rust
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Base {
+    #[vtable(value(this: *const Self) -> i32;)]
+    vtable: *const (),
+}
+#[cpp_struct]
+pub struct Child {
+    #[inherit]
+    #[vtable(
+        offset(0x8);
+        child_value(this: *const Self) -> i32;
+    )]
+    base: Base,
+}
+```
+
+- Every extension starts with an explicit byte `offset`. Parent bindings may
+  describe only a prefix; their last bound slot is not necessarily the native
+  table's end. Offsets are checked for target alignment, overflow and overlap
+  with bound ancestor slots. Unknown parent slots remain the caller's responsibility.
+- For multiple inheritance, put an extension on each selected base field.
+  Each targets that base's primary vptr and passes its native subobject address.
+  Native override thunks perform any further `this` adjustment. A transitive
+  base's primary vptr is resolved through its inherited primary base.
+- Extensions and their methods propagate across modules, crates and further
+  inheritance. Existing bindings dispatch native overrides automatically; do
+  not redeclare their names or slots as extensions.
+- New child-only tables still use separate private `#[vtable]` pointer fields.
+  Virtual inheritance and base tail-padding reuse remain unsupported.
+- Verify slots for each ABI: secondary-base overrides may also occupy primary
+  slots on Itanium, while MSVC keeps them in their secondary tables.
+
 ## Declaration rules
 
 - `#[repr(C)]`, `unsafe extern "C"` slots and `#[inline(always)]` methods are implied.
-- Vtable fields must be private `*const ()` placeholders. Expansion replaces
+- Standalone vtable fields must be private `*const ()` placeholders. Expansion replaces
   each with a pointer to a generated private table. Other fields stay unchanged.
 - `pad(n)` advances by `n` pointer-sized slots; `offset(n)` sets the cursor to
   byte offset `n` from this vtable's start, not a process address. Hex literals
@@ -64,7 +104,11 @@ metadata, and renamed type aliases are not resolved by the macro.
   heading on entries; the generated method keeps that section and includes the
   common native-object/ABI contract without adding another heading.
 - Receivers may be `&self`, `&mut self`, `this: *const Self` or `this: *mut Self`.
-  Raw receivers generate associated functions and never construct references.
+  `this:` receivers generate associated functions and never construct references.
+  Nightly consumers can instead use `self: *const Self` or `self: *mut Self` with
+  `#![feature(arbitrary_self_types_pointers)]` for raw-pointer method syntax.
+  These receivers also avoid references and propagate through `#[inherit]`.
+  Raw-pointer inherent methods take precedence: avoid names such as `add`.
 - Keep native-to-Rust conversions and ownership in handwritten wrappers.
 - Generic structs, virtual inheritance, conditional vtable/inherit fields and
   explicit `repr` attributes are rejected or unsupported.
@@ -120,6 +164,7 @@ by expressions such as `include_str!` cannot be inspected by this macro.
 cargo test --workspace --locked
 cargo test --workspace --locked --release
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo +nightly-2026-10-30 test --workspace --locked --features nightly-receivers
 ```
 
 The separate native-test package compiles C++ objects and validates layout,

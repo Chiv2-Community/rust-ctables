@@ -1,4 +1,5 @@
 //! Native ABI fixtures; public declarations are consumed by cross-crate tests.
+#![cfg_attr(feature = "nightly-receivers", feature(arbitrary_self_types_pointers))]
 #![allow(
     dead_code,
     missing_docs,
@@ -91,6 +92,64 @@ pub struct RawChild {
     pub base: Raw,
 }
 
+#[cfg(feature = "nightly-receivers")]
+#[cpp_struct]
+pub struct PointerRaw {
+    #[vtable(
+        pad(1);
+        add_amount(self: *mut Self, amount: i32) -> i32;
+        get(self: *const Self) -> i32;
+    )]
+    vtable: *const (),
+    value: i32,
+}
+
+#[cpp_struct]
+pub struct ExtendedLeft {
+    #[inherit]
+    #[vtable(
+        offset(0x18);
+        left_extra(this: *const Self, amount: i32) -> i32;
+    )]
+    base: parents::Left,
+}
+
+#[cpp_struct]
+pub struct ExtendedRight {
+    #[inherit]
+    #[vtable(
+        offset(0x10);
+        right_extra(this: *mut Self, amount: i32) -> i32;
+    )]
+    base: parents::Right,
+}
+
+#[cpp_struct]
+pub struct Extended {
+    #[inherit]
+    pub left: ExtendedLeft,
+    #[inherit]
+    pub right: ExtendedRight,
+    extra: i32,
+}
+
+#[cpp_struct]
+pub struct ExtendedDirect {
+    #[inherit]
+    #[vtable(
+        offset(0x18);
+        left_added(&self, amount: i32) -> i32;
+    )]
+    left: parents::Left,
+    #[inherit]
+    #[vtable(
+        offset(0x10);
+        right_added(&mut self, amount: i32) -> i32;
+    )]
+    right: parents::Right,
+    extra: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +166,14 @@ mod tests {
         fn fixture_right_offset(value: *mut Derived) -> usize;
         fn fixture_right_value(value: *mut Derived) -> i32;
         fn fixture_left_value(value: *mut Derived) -> i32;
+        fn fixture_extended_left() -> *mut ExtendedLeft;
+        fn fixture_delete_extended_left(value: *mut ExtendedLeft);
+        fn fixture_extended() -> *mut Extended;
+        fn fixture_delete_extended(value: *mut Extended);
+        fn fixture_extended_size() -> usize;
+        fn fixture_extended_left_size() -> usize;
+        fn fixture_extended_right_offset(value: *mut Extended) -> usize;
+        fn fixture_extended_right_value(value: *mut Extended) -> i32;
     }
 
     #[test]
@@ -179,6 +246,48 @@ mod tests {
                 assert_eq!(view.right_value(), 23);
             }
             fixture_delete(ptr);
+        }
+    }
+
+    #[test]
+    fn extending_a_single_base_reuses_its_vptr() {
+        unsafe {
+            let ptr = fixture_extended_left();
+            assert_eq!(size_of::<ExtendedLeft>(), fixture_extended_left_size());
+            assert_eq!((*ptr).left_value(), 10);
+            assert_eq!(ExtendedLeft::left_extra(ptr, 5), 15);
+            fixture_delete_extended_left(ptr);
+        }
+    }
+
+    #[test]
+    fn multiple_extended_bases_keep_layout_and_native_overrides() {
+        unsafe {
+            let ptr = fixture_extended();
+            assert_eq!(size_of::<Extended>(), fixture_extended_size());
+            assert_eq!(
+                std::mem::offset_of!(Extended, right),
+                fixture_extended_right_offset(ptr)
+            );
+            assert_eq!(Extended::left_extra(ptr, 5), 18);
+            assert_eq!(Extended::right_extra(ptr, 7), 30);
+            assert_eq!(fixture_extended_right_value(ptr), 27);
+            fixture_delete_extended(ptr);
+        }
+    }
+
+    #[test]
+    fn child_extends_both_selected_base_tables_with_reference_receivers() {
+        unsafe {
+            let ptr = fixture_extended();
+            assert_eq!(size_of::<ExtendedDirect>(), fixture_extended_size());
+            {
+                let view = &mut *ptr.cast::<ExtendedDirect>();
+                assert_eq!(view.left_added(5), 18);
+                assert_eq!(view.right_added(7), 30);
+            }
+            assert_eq!(fixture_extended_right_value(ptr), 27);
+            fixture_delete_extended(ptr);
         }
     }
 }

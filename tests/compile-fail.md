@@ -64,3 +64,53 @@ pub struct Unaligned {
     vtable: *const (),
 }
 ```
+
+Extensions cannot overlap bound ancestor slots, including transitive bindings:
+
+```compile_fail,E0080
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Base {
+    #[vtable(value(this: *const Self) -> i32;)]
+    vtable: *const (),
+}
+#[cpp_struct]
+pub struct Child { #[inherit] base: Base }
+#[cpp_struct]
+pub struct Overlap {
+    #[inherit]
+    #[vtable(offset(0); other(this: *const Self) -> i32;)]
+    base: Child,
+}
+```
+
+An extension requires an inherited vptr:
+
+```compile_fail,E0080
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Base { value: i32 }
+#[cpp_struct]
+pub struct Invalid {
+    #[inherit]
+    #[vtable(offset(0); value(this: *const Self) -> i32;)]
+    base: Base,
+}
+```
+
+Extensions require an explicit starting offset:
+
+```compile_fail
+use rust_ctables::cpp_struct;
+#[cpp_struct]
+pub struct Base {
+    #[vtable(value(this: *const Self) -> i32;)]
+    vtable: *const (),
+}
+#[cpp_struct]
+pub struct Invalid {
+    #[inherit]
+    #[vtable(other(this: *const Self) -> i32;)]
+    base: Base,
+}
+```

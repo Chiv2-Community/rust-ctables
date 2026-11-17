@@ -192,6 +192,19 @@ fn rejects_invalid_virtual_declarations() {
 }
 
 #[test]
+fn rejects_non_pointer_typed_self_receivers() {
+    for receiver in [
+        quote!(self: Self),
+        quote!(self: &Self),
+        quote!(self: *mut Other),
+        quote!(mut self: *mut Self),
+    ] {
+        let entries = quote!(get(#receiver););
+        assert!(syn::parse2::<Entries>(entries).is_err());
+    }
+}
+
+#[test]
 fn generates_c_layouts_private_tables_and_unsafe_inline_calls() {
     let generated = start(syn::parse_quote! {
         pub struct Native {

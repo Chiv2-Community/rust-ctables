@@ -13,20 +13,25 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        rust: [1.93.0, nightly-2026-10-30]
+        include:
+          - rust: nightly-2026-10-30
+            features: --features nightly-receivers
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: validation-${{ matrix.os }}
+          key: validation-${{ matrix.os }}-${{ matrix.rust }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - run: cargo test --workspace --locked --release
-      - run: cargo doc --workspace --no-deps --locked
+      - run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+      - run: cargo test --workspace --locked ${{ matrix.features }}
+      - run: cargo test --workspace --locked --release ${{ matrix.features }}
+      - run: cargo doc --workspace --no-deps --locked ${{ matrix.features }}

@@ -15,6 +15,8 @@ use syn::{
     Visibility,
 };
 
+mod primary;
+
 #[derive(Clone)]
 struct Method {
     attrs: Vec<Attribute>,
@@ -65,42 +67,10 @@ impl Parse for Entries {
                 let receiver = args.next().ok_or_else(|| {
                     Error::new(
                         name.span(),
-                        "expected &self, &mut self, or this: *const/*mut Self",
+                        "expected &self, &mut self, self: *const/*mut Self, or this: *const/*mut Self",
                     )
                 })?;
-                let kind = match receiver {
-                    FnArg::Receiver(r) if r.reference.is_some() && r.colon_token.is_none() => {
-                        if r.mutability.is_some() {
-                            "mutable"
-                        } else {
-                            "shared"
-                        }
-                    }
-                    FnArg::Typed(arg) => {
-                        let valid_name = matches!(&*arg.pat, Pat::Ident(p) if p.ident == "this");
-                        match &*arg.ty {
-                            Type::Ptr(p)
-                                if valid_name
-                                    && matches!(&*p.elem, Type::Path(t) if t.path.is_ident("Self")) =>
-                            {
-                                if p.mutability.is_some() {
-                                    "raw_mut"
-                                } else {
-                                    "raw_const"
-                                }
-                            }
-                            _ => {
-                                return Err(Error::new(
-                                    arg.span(),
-                                    "raw receiver must be this: *const Self or this: *mut Self",
-                                ))
-                            }
-                        }
-                    }
-                    r @ FnArg::Receiver(_) => {
-                        return Err(Error::new(r.span(), "expected &self or &mut self"))
-                    }
-                };
+                let kind = receiver_kind(&receiver)?;
                 let mut named = Vec::new();
                 for arg in args {
                     let FnArg::Typed(arg) = arg else {
@@ -128,6 +98,42 @@ impl Parse for Entries {
             input.parse::<Token![;]>()?;
         }
         Ok(Self(entries))
+    }
+}
+
+fn receiver_kind(arg: &FnArg) -> syn::Result<&'static str> {
+    let (ty, is_self) = match arg {
+        FnArg::Receiver(r) if r.reference.is_some() && r.colon_token.is_none() => {
+            return Ok(if r.mutability.is_some() {
+                "mutable"
+            } else {
+                "shared"
+            });
+        }
+        FnArg::Receiver(r) if r.colon_token.is_some() && r.mutability.is_none() => (&*r.ty, true),
+        FnArg::Typed(arg) if matches!(&*arg.pat, Pat::Ident(p) if p.ident == "this" && p.by_ref.is_none() && p.mutability.is_none() && p.subpat.is_none()) => {
+            (&*arg.ty, false)
+        }
+        _ => {
+            return Err(Error::new(
+                arg.span(),
+                "expected &self, &mut self, or a raw receiver self/this: *const/*mut Self",
+            ))
+        }
+    };
+    match ty {
+        Type::Ptr(p) if matches!(&*p.elem, Type::Path(t) if t.path.is_ident("Self")) => {
+            Ok(match (is_self, p.mutability.is_some()) {
+                (true, true) => "pointer_mut",
+                (true, false) => "pointer_const",
+                (false, true) => "raw_mut",
+                (false, false) => "raw_const",
+            })
+        }
+        _ => Err(Error::new(
+            arg.span(),
+            "raw receiver must be self/this: *const Self or self/this: *mut Self",
+        )),
     }
 }
 
@@ -230,14 +236,10 @@ fn start(mut item: ItemStruct) -> syn::Result<Tokens> {
                     "inherit requires a non-generic type path",
                 ));
             }
-            if field
-                .attrs
-                .iter()
-                .any(|a| a.path().is_ident("vtable") || a.path().is_ident("cfg"))
-            {
+            if field.attrs.iter().any(|a| a.path().is_ident("cfg")) {
                 return Err(Error::new(
                     field.span(),
-                    "inherit cannot be combined with vtable or cfg",
+                    "inherit cannot be combined with cfg",
                 ));
             }
             parents.push((field.ident.clone().unwrap(), ty.clone()));
@@ -353,6 +355,8 @@ fn receiver(kind: &Ident) -> (Tokens, Tokens, Tokens) {
         ),
         "raw_const" => (quote!(this: *const Self), quote!(*const Self), quote!(this)),
         "raw_mut" => (quote!(this: *mut Self), quote!(*mut Self), quote!(this)),
+        "pointer_const" => (quote!(self: *const Self), quote!(*const Self), quote!(self)),
+        "pointer_mut" => (quote!(self: *mut Self), quote!(*mut Self), quote!(self)),
         _ => unreachable!(),
     }
 }
@@ -448,7 +452,19 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
     let mut tables = Vec::new();
     let mut impls = Vec::new();
     let mut methods = Vec::new();
-    let mut names = std::collections::HashSet::new();
+    let mut names = [
+        "__ctables_primary_vptr",
+        "__ctables_primary_has_slot",
+        "__CTABLES_HAS_PRIMARY_VTABLE",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<std::collections::HashSet<_>>();
+    let parent_fields = inherited
+        .iter()
+        .map(|(field, _)| field.clone())
+        .collect::<Vec<_>>();
+    let mut table_layouts = Vec::new();
     for (field, ms) in inherited {
         let parent_ty = &fields
             .named
@@ -465,12 +481,13 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
             }
             let method = &m.name;
             let args = m.args.iter().map(|(n, _)| n);
+            let (_, _, this) = receiver(&m.kind);
             let call = match m.kind.to_string().as_str() {
-                "raw_const" => {
-                    quote!(<#parent_ty>::#method(::core::ptr::addr_of!((*this).#field), #(#args),*))
+                "raw_const" | "pointer_const" => {
+                    quote!(<#parent_ty>::#method(::core::ptr::addr_of!((*#this).#field), #(#args),*))
                 }
-                "raw_mut" => {
-                    quote!(<#parent_ty>::#method(::core::ptr::addr_of_mut!((*this).#field), #(#args),*))
+                "raw_mut" | "pointer_mut" => {
+                    quote!(<#parent_ty>::#method(::core::ptr::addr_of_mut!((*#this).#field), #(#args),*))
                 }
                 _ => quote!(self.#field.#method(#(#args),*)),
             };
@@ -490,7 +507,8 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
         if attrs.len() != 1 {
             return Err(Error::new(field.span(), "duplicate vtable attribute"));
         }
-        if !matches!(field.vis, Visibility::Inherited) {
+        let extends = parent_fields.contains(field.ident.as_ref().unwrap());
+        if !extends && !matches!(field.vis, Visibility::Inherited) {
             return Err(Error::new(
                 field.vis.span(),
                 "vtable pointers must be private",
@@ -502,7 +520,8 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                 "conditional vtable fields are not supported",
             ));
         }
-        if !matches!(&field.ty, Type::Ptr(p) if p.const_token.is_some() && matches!(&*p.elem, Type::Tuple(t) if t.elems.is_empty()))
+        if !extends
+            && !matches!(&field.ty, Type::Ptr(p) if p.const_token.is_some() && matches!(&*p.elem, Type::Tuple(t) if t.elems.is_empty()))
         {
             return Err(Error::new(
                 field.ty.span(),
@@ -510,6 +529,12 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
             ));
         }
         let entries = attrs[0].parse_args::<Entries>()?;
+        if extends && !matches!(entries.0.first(), Some(Entry::Offset(_))) {
+            return Err(Error::new(
+                field.span(),
+                "inherited vtable extensions must start with an explicit offset",
+            ));
+        }
         let fname = field.ident.as_ref().unwrap();
         let table = if fname == "vtable" {
             format_ident!("{}VTable", name)
@@ -570,16 +595,27 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                     ));
                     let args = m.args.iter().map(|(n, _)| n);
                     let owner = Ident::new("__owner", proc_macro2::Span::mixed_site());
-                    let adjusted = if matches!(m.kind.to_string().as_str(), "mutable" | "raw_mut") {
-                        quote!(::core::ptr::addr_of_mut!((*#owner).#fname).cast::<Self>())
+                    let native = Ident::new("__native", proc_macro2::Span::mixed_site());
+                    let parent_ty = &field.ty;
+                    let vptr = if extends {
+                        quote!(<#parent_ty>::__ctables_primary_vptr(::core::ptr::addr_of!((*#owner).#fname)))
                     } else {
-                        quote!(::core::ptr::addr_of!((*#owner).#fname).cast::<Self>())
+                        quote!(::core::ptr::addr_of!((*#owner).#fname))
+                    };
+                    let adjusted = if matches!(
+                        m.kind.to_string().as_str(),
+                        "mutable" | "raw_mut" | "pointer_mut"
+                    ) {
+                        quote!(#native.cast_mut().cast::<Self>())
+                    } else {
+                        quote!(#native.cast::<Self>())
                     };
                     impls.push(forwarding(
                         &m,
                         &quote!({
                             let #owner = #this;
-                            ((*(*#owner).#fname).#method)(#adjusted, #(#args),*)
+                            let #native = #vptr;
+                            ((*(*#native).cast::<#table>()).#method)(#adjusted, #(#args),*)
                         }),
                     ));
                     methods.push(m);
@@ -594,10 +630,17 @@ fn finish(mut item: ItemStruct, inherited: Vec<(Ident, Vec<Method>)>) -> syn::Re
                 Err(e) => e.into_compile_error(),
             };
             tables.push(quote!(#[cfg(target_pointer_width = #cfg)] #definition));
+            if extends {
+                tables.push(primary::validate_extension(&field.ty, &layout, width));
+            }
         }
-        field.ty = syn::parse_quote!(*const #table);
+        table_layouts.push((fname.clone(), layout));
+        if !extends {
+            field.ty = syn::parse_quote!(*const #table);
+        }
         field.attrs.retain(|a| !a.path().is_ident("vtable"));
     }
+    impls.push(primary::api(fields, &parent_fields, &table_layouts));
     let metadata = metadata(&item, &methods);
     Ok(quote! {
         #[repr(C)] #item

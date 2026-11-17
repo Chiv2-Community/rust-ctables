@@ -38,6 +38,26 @@ struct Raw {
     virtual int get() const { return value; }
 };
 
+struct ExtendedLeft : Left {
+    ExtendedLeft() : Left(10) {}
+    virtual int left_extra(int amount) const { return x + amount; }
+};
+
+struct ExtendedRight : Right {
+    ExtendedRight() : Right(20) {}
+    virtual int right_extra(int amount) { y += amount; return y; }
+};
+
+struct Extended : ExtendedLeft, ExtendedRight {
+    int extra = 3;
+    int left_extra(int amount) const override { return x + amount + extra; }
+    int right_extra(int amount) override { y += amount; return y + extra; }
+};
+
+struct ExtendedGrandchild : Extended {
+    virtual int grandchild_value() const { return x + y + extra; }
+};
+
 extern "C" {
 Derived* fixture_new() { return new Derived; }
 void fixture_delete(Derived* value) { value->~Derived(); ::operator delete(value); }
@@ -52,4 +72,16 @@ std::size_t fixture_right_offset(Derived* value) {
 }
 int fixture_right_value(Derived* value) { return value->right_value(); }
 int fixture_left_value(Derived* value) { return value->left_value(); }
+ExtendedLeft* fixture_extended_left() { return new ExtendedLeft; }
+void fixture_delete_extended_left(ExtendedLeft* value) { value->~ExtendedLeft(); ::operator delete(value); }
+Extended* fixture_extended() { return new Extended; }
+void fixture_delete_extended(Extended* value) { value->~Extended(); ::operator delete(value); }
+ExtendedGrandchild* fixture_extended_grandchild() { return new ExtendedGrandchild; }
+void fixture_delete_extended_grandchild(ExtendedGrandchild* value) { value->~ExtendedGrandchild(); ::operator delete(value); }
+std::size_t fixture_extended_size() { return sizeof(Extended); }
+std::size_t fixture_extended_left_size() { return sizeof(ExtendedLeft); }
+std::size_t fixture_extended_right_offset(Extended* value) {
+    return reinterpret_cast<char*>(static_cast<ExtendedRight*>(value)) - reinterpret_cast<char*>(value);
+}
+int fixture_extended_right_value(Extended* value) { return value->right_value(); }
 }
